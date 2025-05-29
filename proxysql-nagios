@@ -2,27 +2,158 @@
 
 import argparse
 import hashlib
-import logging
 import MySQLdb
 import os, sys
+import traceback
+from enum import IntEnum
 
-OK = 0
-WARNING = 1
-CRITICAL = 2
-UNKNOWN = 3
+class nagstatus(IntEnum):
+  OK = 0
+  WARNING = 1
+  CRITICAL = 2
+  UNKNOWN = 3
 
-version = '1.0.0'
-nagioslogger = logging.getLogger(__name__)
+def is_float(value):
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
 
-def debug_factory(logger, debug_level):
-    """
-    Decorate logger in order to add custom levels for Nagios
-    """
-    def custom_debug(msg, *args, **kwargs):
-         if logger.level >= debug_level:
-              return
-         logger._log(debug_level, msg, args, kwargs)
-    return custom_debug
+def custom_exception_handler(exc_type, exc_value, exc_traceback):
+    # Get the traceback information
+    if exc_type is None:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+
+    # Print the exception type, value, and traceback
+    print(f"Exception Type: {exc_type.__name__}")
+    print(f"Exception Value: {exc_value}")
+    print("Traceback:")
+    traceback.print_tb(exc_traceback, file=sys.stdout)
+
+    # Extract and print specific line number
+    tb_info = traceback.extract_tb(exc_traceback)
+    filename, line_number, function_name, text = tb_info[-1]
+    print(f"Error occurred in file: {filename}, line: {line_number}, function: {function_name}")
+    sys.exit(nagstatus.UNKNOWN)
+
+# Replace the default exception handler
+sys.excepthook = custom_exception_handler
+
+def dump(obj):
+  for attr in dir(obj):
+    print("obj.%s = %r" % (attr, getattr(obj, attr)))
+
+class threshold:
+    inc = None
+    lower = None
+    upper = None
+
+    def __init__(self, inc, lower, upper):
+        self.inc = 1 if not inc is None and int(inc) > 0 else 0
+        self.lower = float(lower)
+        self.upper = float(upper)
+
+    @classmethod
+    def parse(cls, thresh):
+        lower = None
+        upper = None
+
+        if thresh:
+            thresh = thresh.strip()
+        if not (thresh and len(thresh) > 0):
+            return threshold(None, None, None)
+
+        if thresh[0] == '@':
+            inc = 1
+            thresh = thresh[1:]
+        else:
+            inc = 0
+        tr = thresh.split(':')
+        while len(tr) < 2:
+            tr.insert(0, '')
+        for i in range(0, 2, 1):
+            p = tr[i].strip()
+            if not is_float(p):
+                if p == '~':
+                    val = -float('inf')
+                elif p == 'i':
+                    val = float('inf')
+                else:
+                  val = -float('inf') if i == 0 else float('inf')
+            else:
+                val = float(tr[i])
+
+            if i == 0:
+                lower = val
+            else:
+                upper = val
+
+        if lower == -float('inf') and not ':' in thresh and lower < upper and upper >= 0:
+            lower = 0
+        if lower <= upper and (thresh == ':' or not (lower == -float('inf') and upper == float('inf'))):
+            return threshold(inc, lower, upper)
+        else:
+            return threshold(None, None, None)
+
+    def test(self, metric):
+        ret = metric < self.lower or metric > self.upper
+        return ret if self.inc == 0 else not ret
+
+    def __str__(self):
+        inc = '@' if self.inc == 1 else ''
+        if inc or not self.lower == float(0) or self.upper == float('inf'):
+            lower = str(self.lower if not self.lower.is_integer() else int(self.lower))
+        else:
+            lower = ''
+
+        if inc or self.upper < float('inf'):
+            upper = str(self.upper if not self.upper.is_integer() else int(self.upper))
+        else:
+            upper = ''
+
+        sep1 = ''
+        sep2 = ''
+        if inc:
+            sep1 = ':'
+        else:
+            if upper == float('inf'):
+                sep2 = ':'
+            elif lower:
+                sep1 = ':'
+
+        if lower == '-inf':
+            lower = '~'
+
+        return f"{inc}{lower}{sep1}{upper}{sep2}"
+
+class thresholds:
+    warn = None
+    crit = None
+    happy = False
+
+    def __init__(self, warn, crit):
+        if isinstance(warn, str):
+            warn = threshold.parse(warn)
+        if isinstance(crit, str):
+            crit = threshold.parse(crit)
+        if isinstance(warn, threshold) and isinstance(crit, threshold):
+            self.warn = warn
+            self.crit = crit
+        if not (warn is None or crit is None or warn.inc is None or crit.inc is None):
+            self.happy = True
+
+    def test(self, metric):
+        if not is_float(metric):
+            return nagstatus.UNKNOWN
+        elif self.crit.test(float(metric)):
+            return nagstatus.CRITICAL
+        elif self.warn.test(float(metric)):
+            return nagstatus.WARNING
+        else:
+            return nagstatus.OK
+
+version = '1.2.0'
 
 def get_args():
     """
@@ -41,28 +172,25 @@ def get_args():
     parser.add_argument('-d', '--defaults-file', required=False,
                         help='ProxySQL defaults file (include the path to the file location and specify [proxysql-nagios] group)', dest='defaults_file', type=str, default=None)
     parser.add_argument('-t', '--type', required=True,
-                        help='ProxySQL check type (one of conns,hg,rules,status,var)', dest='check_type', 
-                        choices=['conns','hg','rules','status','var'], type=str, default='status')
+                        help='ProxySQL check type (one of conns,hg,rules,status,var,pers)', dest='check_type',
+                        choices=['conns','hg','rules','status','var','pers'], type=str, default='status')
     parser.add_argument('-n', '--name', required=False,
-                        help='ProxySQL variable name to check', dest='var_name', type=str, default=None)
-    parser.add_argument('-l', '--lower', required=False,
-                        help='Alert if ProxySQL value are LOWER than defined WARN / CRIT thresholds (only applies to "var" check type', dest='lower', action='store_true')
+                        help='ProxySQL variable name (for var) or table name (for persistence) to check', dest='obj_name', type=str, default=None)
     parser.add_argument('-r', '--runtime', required=False,
                         help='Force ProxySQL Nagios check to query the runtime_mysql_XXX tables rather than the mysql_XXX tables, although this is more correct ' \
                              'it can lead to excessive logging in ProxySQL and needs to be explicitely enabled (applies to "conns" and "rules" check types)',
                              dest='runtime', action='store_true')
     parser.add_argument('-w', '--warning', required=False,
-                        help='Warning threshold', dest='warn_thresh', type=int, default=None)
+                        help='Warning threshold', dest='warn_thresh', type=str, default=None)
     parser.add_argument('-c', '--critical', required=False,
-                        help='Critical threshold', dest='crit_thresh', type=int, default=None)
+                        help='Critical threshold', dest='crit_thresh', type=str, default=None)
     parser.add_argument('-i', '--include-hostgroup', required=False,
                         help='ProxySQL hostgroup(s) to include (only applies to "--type hg" checks, accepts comma-separated list)', dest='include_hg', type=str, default=None)
     parser.add_argument('-g', '--ignore-hostgroup', required=False,
                         help='ProxySQL hostgroup(s) to ignore (only applies to "--type hg" checks, accepts comma-separated list)', dest='ignore_hg', type=str, default=None)
-    parser.add_argument('--log-file', required=False,
-                        help='File to log to (default = stdout)', dest='logfile', type=str)
-    parser.add_argument('--text', required=False,
-                        help='Disable Nagios output mode and output pure text', dest='text_output', action='store_true')
+    parser.add_argument('-m', '--metric', required=False,
+                        help="For --type conns, metric ('pct_used' or 'error'); For --type pers, column list to include in comparison (comma separated, prefix with '#' to exclude, default is all cols)",
+                        dest='conn_metric', type=str, default='')
     args = parser.parse_args()
     return args
 
@@ -99,45 +227,59 @@ def proxysql_conn(host, port, user, passwd, defaults_file=None, timeout=60):
         raise
     return conn
 
-def pvar_check(pconn, nagioslogger, args):
+def pvar_check(pconn, args):
     pcursor = pconn.cursor(MySQLdb.cursors.DictCursor)
-    pcursor.execute('SELECT variable_value current FROM stats.stats_mysql_global where variable_name = "%s";' % args.var_name)
-    output_value = int(pcursor.fetchone()['current'])
+    vname = str(args.obj_name).replace("'", "''")
+    pcursor.execute(f"SELECT variable_value current FROM stats.stats_mysql_global where variable_name = '{vname}'")
+    val =  pcursor.fetchone()
     pconn.close()
 
-    if not args.lower:
-        if output_value < args.warn_thresh:
-            nagioslogger.info("%s: %s" % (args.var_name, output_value))
-            sys.exit(OK)
-        elif output_value >= args.crit_thresh:
-            nagioslogger.critical("%s: %s" % (args.var_name, output_value))
-            sys.exit(CRITICAL)
-        elif output_value >= args.warn_thresh:
-            nagioslogger.warning("%s: %s" % (args.var_name, output_value))
-            sys.exit(WARNING)
-        else:
-            nagioslogger.unknown("%s: %s" % (args.var_name, output_value)) if not args.text_output else nagioslogger.info("%s %s" % (args.var_name, output_value))
-            sys.exit(UNKNOWN)
+    if val:
+      val = val['current'].strip().lower()
+      if is_float(val):
+        metric = float(val)
+        metric = int(metric) if metric.is_integer() else metric
+        val = metric
+      elif val in ('yes', 'true', 't', 'y', '1'):
+        metric = 1
+      elif val in ("false", "no", "f", "n", "0", "off"):
+        metric = 0
     else:
-        if output_value > args.crit_thresh:
-            nagioslogger.info("%s: %s" % (args.var_name, output_value))
-            sys.exit(OK)
-        elif output_value <= args.crit_thresh:
-            nagioslogger.critical("%s: %s" % (args.var_name, output_value))
-            sys.exit(CRITICAL)
-        elif output_value <= args.warn_thresh:
-            nagioslogger.warning("%s: %s" % (args.var_name, output_value))
-            sys.exit(WARNING)
-        else:
-            nagioslogger.unknown("%s: %s" % (args.var_name, output_value)) if not args.text_output else nagioslogger.info("%s %s" % (args.var_name, output_value))
-            sys.exit(UNKNOWN)
+      val = 'Unknown'
 
-def pconn_check(pconn, nagioslogger, args):
+    ex = nagstatus.UNKNOWN
+
+    if 'metric' in locals():
+        ex = args.bounds.test(metric)
+    elif val:
+      metric = 'U'
+      ex = nagstatus.OK
+
+    msg = f"{args.obj_name}:{val}"
+    msg = f"{ex.name} - {msg} | '{args.obj_name}'={metric};{args.bounds.warn};{args.bounds.crit}"
+
+    print(msg)
+    sys.exit(ex)
+
+def pconn_check(pconn, args):
     pcursor = pconn.cursor(MySQLdb.cursors.DictCursor)
     if args.runtime:
         srv_table = 'runtime_mysql_servers'
     else:
         srv_table = 'mysql_servers'
+
+    if args.conn_metric == 'error':
+        q_conn_metric = 'ConnERR'
+        conn_metric_name = 'ConnERR'
+        conn_metric_unit = ''
+    elif args.conn_metric in ('pct_used', ''):
+        q_conn_metric = 'cast((ConnUsed*1.0/max_connections)*1000 as int)/10.0'
+        conn_metric_name = 'pct_used'
+        conn_metric_unit = '%'
+    else:
+        ex = nagstatus.UNKNOWN
+        print(f"{ex.name} - Unknown metric '{args.conn_metric}'")
+        sys.exit(ex)
 
     if args.ignore_hg is not None:
         ignore_hg = 'AND s.hostgroup NOT IN (%s)' % args.ignore_hg
@@ -147,14 +289,14 @@ def pconn_check(pconn, nagioslogger, args):
         include_hg = 'AND s.hostgroup IN (%s)' % args.include_hg
     else:
         include_hg = ''
-        
-    pcursor.execute('SELECT hostgroup_id hg, srv_host srv, port, cast((ConnUsed*1.0/max_connections)*100 as int) pct_used ' \
+
+    pcursor.execute('SELECT hostgroup_id hg, srv_host srv, port, %s metric ' \
                     'FROM main.%s r ' \
                     'JOIN stats.stats_mysql_connection_pool s ' \
                     'ON r.hostgroup_id = s.hostgroup ' \
                     'AND srv_host = hostname ' \
                     'AND srv_port = port %s %s ' \
-                    'ORDER BY pct_used desc;' % (srv_table, ignore_hg, include_hg))
+                    'ORDER BY metric desc;' % (q_conn_metric, srv_table, ignore_hg, include_hg))
 
     output_values = pcursor.fetchall()
 
@@ -162,34 +304,50 @@ def pconn_check(pconn, nagioslogger, args):
     fmt_warn_output = list()
     fmt_crit_output = list()
     fmt_unk_output = list()
+    rows = 0
+    perf = 0
 
     for output_value in output_values:
-        vals = ('hg: %s' % output_value['hg'], 'srv: %s' % output_value['srv'], 'port: %s' % output_value['port'], 'pct_used: %s%%' % output_value['pct_used'])
-        if int(output_value['pct_used']) < args.warn_thresh:
-            fmt_ok_output.append(', '.join(vals))
-        elif int(output_value['pct_used']) >= args.crit_thresh:
-            fmt_crit_output.append(', '.join(vals))
-        elif int(output_value['pct_used']) >= args.warn_thresh:
-            fmt_warn_output.append(', '.join(vals))
+        vals = f"[hg:{output_value['hg']}, srv:{output_value['srv']}, port:{output_value['port']}, {conn_metric_name}: {output_value['metric']}{conn_metric_unit}]"
+        metric = float(output_value['metric'])
+        metric = int(metric) if metric.is_integer() else metric
+        perf = metric if metric > perf else perf
+        rows += 1
+        ex = args.bounds.test(metric)
+        if ex == nagstatus.CRITICAL:
+            fmt_crit_output.append(vals)
+        elif ex == nagstatus.WARNING:
+            fmt_warn_output.append(vals)
         else:
-            fmt_unk_output.append(', '.join(vals))
+            fmt_ok_output.append(vals)
 
     pconn.close()
 
-    if len(fmt_unk_output) > 0:
-        nagioslogger.unknown("ProxySQL Connections: %s" % fmt_unk_output) if not args.text_output else nagioslogger.info("ProxySQL Connections: %s" % fmt_unk_output)
-        sys.exit(UNKNOWN)
-    elif len(fmt_crit_output) > 0:
-        nagioslogger.critical("ProxySQL Connections: %s" % fmt_crit_output)
-        sys.exit(CRITICAL)
-    elif len(fmt_warn_output) > 0:
-        nagioslogger.warning("ProxySQL Connections: %s" % fmt_warn_output)
-        sys.exit(WARNING) 
-    else:
-        nagioslogger.info("ProxySQL Connections: %s" % fmt_ok_output) 
-        sys.exit(OK)
+    ex = nagstatus.UNKNOWN
 
-def phg_check(pconn, nagioslogger, args):
+    if rows == 0:
+        perf = 'U'
+        fmt_unk_output = ("Unknown")
+    elif len(fmt_crit_output) > 0:
+        ex = nagstatus.CRITICAL
+    elif len(fmt_warn_output) > 0:
+        ex = nagstatus.WARNING
+    else:
+        ex = nagstatus.OK
+
+    listout = list()
+    listout.extend(fmt_crit_output)
+    listout.extend(fmt_warn_output)
+    listout.extend(fmt_unk_output)
+    listout.extend(fmt_ok_output)
+
+    msg = ', '.join(listout)
+    msg = f"{ex.name} - Conns:{msg} | '{conn_metric_name}'={perf};{args.bounds.warn};{args.bounds.crit}"
+
+    print(msg)
+    sys.exit(ex)
+
+def phg_check(pconn, args):
     if args.ignore_hg is not None:
         ignore_hg = 'AND sl.hostgroup NOT IN (%s)' % args.ignore_hg
     else:
@@ -201,46 +359,65 @@ def phg_check(pconn, nagioslogger, args):
 
     max_thresh = max(args.warn_thresh, args.crit_thresh)
     pcursor = pconn.cursor(MySQLdb.cursors.DictCursor)
-    pcursor.execute('SELECT sl.hostgroup hg,count(sr.hostgroup) cnt ' \
+    pcursor.execute('SELECT sl.hostgroup hg, count(sr.hostgroup) cnt ' \
                     'FROM stats_mysql_connection_pool sl ' \
                     'LEFT JOIN stats_mysql_connection_pool sr ' \
                     'ON sl.hostgroup = sr.hostgroup ' \
                     'AND sl.srv_host = sr.srv_host AND sl.srv_port = sr.srv_port AND sr.status = "ONLINE" ' \
                     'GROUP BY sl.hostgroup ' \
-                    'HAVING cnt <= %s %s %s;' % (max_thresh, include_hg, ignore_hg))
+                    'HAVING 1 = 1 %s %s;' % (include_hg, ignore_hg))
 
     output_values = pcursor.fetchall()
     pconn.close()
 
-    if len(output_values) == 0:
-        nagioslogger.info("ProxySQL Hostgroups: ALL OK")
-        sys.exit(OK)
-    else:
-        fmt_warn_output = list()
-        fmt_crit_output = list()
-        fmt_unk_output = list()
-        for output_value in output_values:
-            if int(output_value['cnt']) <= args.crit_thresh:
-                fmt_crit_output.append(', '.join(['hg: %s' % output_value['hg'],'online_cnt: %s' % output_value['cnt']]))
-            elif int(output_value['cnt']) <= args.warn_thresh:
-                fmt_warn_output.append(', '.join(['hg: %s' % output_value['hg'],'online_cnt: %s' % output_value['cnt']]))
-            else:
-                fmt_unk_output.append(', '.join(['hg: %s' % output_value['hg'],'online_cnt: %s' % output_value['cnt']]))
-        if len(fmt_unk_output) > 0:
-            nagioslogger.unknown("ProxySQL Hostgroups: %s" % fmt_unk_output) if not args.text_output else nagioslogger.info("ProxySQL Hostgroups: %s" % fmt_unk_output)
-            sys.exit(UNKNOWN)
-        elif len(fmt_crit_output) > 0:
-            if len(fmt_warn_output) > 0:
-                nagioslogger.critical("ProxySQL Hostgroups: CRIT - %s WARN - %s" % (fmt_crit_output, fmt_warn_output))
-                sys.exit(CRITICAL)
-            else:
-                nagioslogger.critical("ProxySQL Hostgroups: %s" % fmt_crit_output)
-                sys.exit(CRITICAL)
-        elif len(fmt_warn_output) > 0:
-            nagioslogger.warning("ProxySQL Hostgroups: %s" % fmt_warn_output)
-            sys.exit(WARNING) 
+    ex = nagstatus.UNKNOWN
+    msg = ''
+    perf = 'U'
 
-def prules_check(pconn, nagioslogger, args):
+    fmt_warn_output = list()
+    fmt_crit_output = list()
+    fmt_ok_output = list()
+    fmt_unk_output = list()
+    backends = 0
+    least = float('inf')
+    most = -float('inf')
+
+    for output_value in output_values:
+        vals=f"[hg:{output_value['hg']},online_cnt:{output_value['cnt']}]"
+        if not is_float(output_value['cnt']):
+            fmt_unk_output.append(vals)
+        else:
+            backends += int(output_value['cnt'])
+            metric = int(output_value['cnt'])
+            least = metric if metric < least else least
+            most = metric if metric > most else most
+            ex = args.bounds.test(metric)
+            if ex == nagstatus.CRITICAL:
+                fmt_crit_output.append(vals)
+            elif ex == nagstatus.WARNING:
+                fmt_warn_output.append(vals)
+            else:
+                fmt_ok_output.append(vals)
+
+    if len(fmt_crit_output) > 0:
+        ex = nagstatus.CRITICAL
+    elif len(fmt_warn_output) > 0:
+        ex = nagstatus.WARNING
+    elif len(fmt_unk_output) == 0:
+        ex = nagstatus.OK
+
+    out = list()
+    out.extend(fmt_crit_output)
+    out.extend(fmt_warn_output)
+    out.extend(fmt_unk_output)
+    out.extend(fmt_ok_output)
+    msg = ', '.join(out)
+    msg = f"{ex.name} - {msg} | 'hg_least'={least};{args.bounds.warn};{args.bounds.crit} 'hg_most'={most};{args.bounds.warn};{args.bounds.crit} 'total_backends'={backends}"
+
+    print(msg)
+    sys.exit(ex)
+
+def prules_check(pconn, args):
     if args.runtime:
         srv_table = 'runtime_mysql_query_rules'
     else:
@@ -256,75 +433,160 @@ def prules_check(pconn, nagioslogger, args):
     doutput_values = pcursor.fetchall()
     pconn.close()
 
-    if hashlib.md5(str(routput_values)).hexdigest() == hashlib.md5(str(doutput_values)).hexdigest():
-        nagioslogger.info('ProxySQL Query Rules: DISK / RUNTIME config matches')
-        sys.exit(OK)
+    ex = nagstatus.UNKNOWN
+    msg = 'Unknown'
+    matched = 0
+
+    if hashlib.md5(str(routput_values).encode('utf-8')).hexdigest() == hashlib.md5(str(doutput_values).encode('utf-8')).hexdigest():
+        ex = nagstatus.OK
+        msg = 'Runtime and on-disk rules match'
+        matched = 1
     else:
-        nagioslogger.critical('ProxySQL Query Rules: DISK / RUNTIME config does not match')
-        sys.exit(CRITICAL)
+        if args.bounds.happy:
+            ex = args.bounds.test(matched)
+        else:
+            ex = nagstatus.CRITICAL
+      
+        msg = 'Runtime and on-disk rules DO NOT match'
+
+
+    msg = f"{ex.name} - {msg} | 'RulesStatus'={matched};1:1;1:1"
+
+    print(msg)
+    sys.exit(ex)
+
+def ppersist_check(pconn, args):
+    tbl = args.obj_name.strip().lower().replace('"', ' ').replace("'", ' ')
+    col_ifilt = list()
+    col_xfilt = list()
+    col_filt = ''
+    if args.conn_metric:
+        for tcol in args.conn_metric.split(','):
+            tcol = tcol.replace('"', '').replace("'", '').strip()
+            if tcol.startswith('#'):
+                col_xfilt.append(tcol[1:])
+            else:
+                col_ifilt.append(tcol)
+
+    if len(col_xfilt):
+        col_filt += " AND name NOT IN ('" + "', '".join(col_xfilt) + "')"
+    if len(col_ifilt):
+        col_filt += " AND name IN ('" + "', '".join(col_ifilt) + "')"
+
+    if col_filt:
+        col_filt = 'WHERE 1 = 1 ' + col_filt
+
+    qcols = list()
+    gcols = list()
+    gby = ''
+    query = 'SELECT "name" FROM pragma_table_info("' + tbl + '") ' + col_filt + ' ORDER BY "cid"'
+    pcursor = pconn.cursor(MySQLdb.cursors.DictCursor)
+    pcursor.execute(query)
+    ucols = pcursor.fetchall()
+    if not len(ucols):
+        print("UNKNOWN - Bad table name or bad column list")
+        sys.exit(nagstatus.UNKNOWN)
+
+    for col in ucols:
+        nm = '"' + col['name'] + '"'
+        if tbl == 'mysql_users' and nm in ('"backend"', '"frontend"'):
+            qcols.append(f"max({nm}) as {nm}")
+        elif tbl == 'mysql_users' and nm in ('"default_schema"'):
+            qcols.append(f"nullif({nm}, '') as {nm}")
+            gcols.append(nm)
+        else:
+            qcols.append(nm)
+            if tbl == 'mysql_users':
+                gcols.append(nm)
+
+    query = 'SELECT ' + ', '.join(qcols) + ' FROM %s AS t'
+    if tbl == 'mysql_users':
+        gby = ' GROUP BY ' + ', '.join(gcols)
+
+    ignore_hg = ''
+    include_hg = ''
+    if tbl == 'mysql_servers':
+        if args.ignore_hg is not None:
+            ignore_hg = ' AND hostgroup_id NOT IN (%s)' % args.ignore_hg
+
+        if args.include_hg is not None:
+            include_hg = ' AND hostgroup_id IN (%s)' % args.include_hg
+
+    query = query + ' WHERE 1=1' + ignore_hg + include_hg + gby + ' ORDER BY ' + ', '.join(gcols if tbl == 'mysql_users' else qcols)
+
+    prev_hv = None
+    matched = 1
+    pcursor = pconn.cursor()
+    msgs = list()
+    for loc in ['main.', 'disk.', 'main.runtime_']:
+        if loc == 'main.runtime_':
+            loc = 'main.' + '"' + 'runtime_' + tbl + '"'
+        else:
+            loc = loc + '"' + tbl + '"'
+        pcursor.execute(query % loc)
+        qout = pcursor.fetchall()
+        hv = hashlib.md5(str(qout).encode('utf-8')).hexdigest()
+        msgs.append(f"[{loc} hash:{hv}]")
+        if prev_hv is None:
+            prev_hv = hv
+            continue
+        else:
+            matched = matched & int(prev_hv == hv)
+    pconn.close()
+
+    if matched:
+        ex = nagstatus.OK
+        msg = f"Runtime, Main, and Disk {tbl} tables match"
+    else:
+        if args.bounds.happy:
+            ex = args.bounds.test(matched)
+        else:
+            ex = nagstatus.CRITICAL
+
+        msg = f"Runtime, Main, and Disk {tbl} tables DO NOT match: " + ", ".join(msgs)
+
+    msg = f"{ex.name} - {msg} | '{tbl}_Persisted'={matched};1:1;1:1"
+
+    print(msg)
+    sys.exit(ex)
+
 
 def main():
     # Handling arguments
     args = get_args()
-    log_file = None
-    if args.logfile:
-        log_file = args.logfile[0]
-    # Logging settings
-    # log_level = logging.DEBUG
-    log_level = logging.INFO
+    setattr(args, 'bounds', thresholds(args.warn_thresh, args.crit_thresh))
+    if args.check_type == 'status' and not args.warn_thresh and not args.crit_thresh:
+        args.bounds = thresholds('600:', '300:')
 
-    if not args.text_output:
-        # Add custom level unknown
-        logging.addLevelName(logging.DEBUG+1, 'UNKNOWN')
-        setattr(nagioslogger, 'unknown', debug_factory(nagioslogger, logging.DEBUG+1))
+    if not args.check_type in ('rules', 'pers') and not args.bounds.happy:
+        sys.stderr.write("You must specify valid --critical and --warning thresholds for check type %s\n" % args.check_type)
+        sys.exit(nagstatus.CRITICAL)
 
-        # Change INFO LevelName to OK
-        logging.addLevelName(logging.INFO, 'OK')
-
-        # Setting output format for Nagios
-        if log_file:
-            logging.basicConfig(filename=log_file,format='%(levelname)s - %(message)s',level=logging.INFO)
-        else:
-            logging.basicConfig(stream=sys.stdout,format='%(levelname)s - %(message)s',level=logging.INFO)
-    else:
-        logging.basicConfig(filename=log_file,format='%(asctime)s %(levelname)s %(message)s',level=log_level)
-
-    if args.check_type not in ('rules','status') and (args.warn_thresh is None or args.crit_thresh is None):
-        nagioslogger.error("You must specify --critical and --warning thresholds for check type %s" % args.check_type)
-        sys.exit(CRITICAL)
-        if args.warn_thresh >= args.crit_thresh and args.lower is False:
-            nagioslogger.error("You must specify --critical threshold higher than --warning thresholds for regular %s check" % args.check_type)
-            sys.exit(CRITICAL)
-        elif args.warn_thresh <= args.crit_thresh and args.lower is True:
-            nagioslogger.error("You must specify --warning threshold higher than --critical thresholds for --lower %s check" % args.check_type)
-            sys.exit(CRITICAL)
-
-    # ProxySQL Initialise Nagios Check 
-    nagioslogger.debug('Running %s check' % args.check_type)
+    # ProxySQL Initialise Nagios Check
     try:
         pconn = proxysql_conn(args.host, args.port, args.user, args.passwd, args.defaults_file)
         # ProxySQL Status Var Check
         if args.check_type == 'status':
-            args.var_name = 'ProxySQL_Uptime'
-            args.crit_thresh = 300
-            args.warn_thresh = 600
-            args.lower = True
-            pvar_check(pconn, nagioslogger, args)
-        # ProxySQL Global Status Var Check
+            args.obj_name = 'ProxySQL_Uptime'
+            pvar_check(pconn, args)
+        # ProxySQL Global Var Check
         elif args.check_type == 'var':
-            pvar_check(pconn, nagioslogger, args)
+            pvar_check(pconn, args)
         # ProxySQL Connection Pool Usage Check
         elif args.check_type == 'conns':
-            pconn_check(pconn, nagioslogger, args)
+            pconn_check(pconn, args)
         # ProxySQL Hostgroup Availability Check
         elif args.check_type == 'hg':
-            phg_check(pconn, nagioslogger, args)
+            phg_check(pconn, args)
         elif args.check_type == 'rules':
-            prules_check(pconn, nagioslogger, args)
+            prules_check(pconn, args)
+        elif args.check_type == 'pers':
+            ppersist_check(pconn, args)
         # End of Nagios Checks
+
     except Exception as e:
-        nagioslogger.critical('ProxySQL check failed: %s' % e)
-        sys.exit(CRITICAL)
+        exc_type, exc_obj, tb = sys.exc_info()
+        custom_exception_handler(exc_type, exc_obj, tb)
 
 if __name__ == "__main__":
     main()

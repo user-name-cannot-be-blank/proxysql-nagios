@@ -1,0 +1,37 @@
+#check mysql listener paused (bool is converted to int before checking, good state is mysql_listener_paused=false)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t var -n mysql_listener_paused -w 0 -c 0
+
+# generated error packets (the thresholds here are infinity; this will never alert, but will produce performance data for logging)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t var -n generated_error_packets -w i -c i
+
+# check proxysql uptime status (reports uptime, thresholds set for critical if less than 30 mins, and warning if less than 60 mins)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t status -w 3600: -c 1800:
+
+# check proxysql rules persisted (checks than disk and runtime mysql_query_rules tables are in sync, reports 1 when that is true, so thresholds are to alert if less than 1)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t rules
+
+# check proxysql conns errors (check reported errors per hostgroup, excluding hostgroup 1)
+proxysql-nagios -h -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -g 1 -t conns -m error -w 100 -c 200
+
+# check proxysql conns pct_used (check percentage used of allowed connections per hostgroup, excluding hostgroup 1)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -g 1 -t conns -m pct_used -w 50 -c 90
+
+# check proxysql hostgroup status (check number of hosts live in hostgroups, excluding hostgroup 1; critical if less than 1, warning if greater than 2)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -g 1 -t hg -w 2 -c 1:
+
+# check proxysql hostgroup status (check number of hosts live in hostgroup 10; critical if not exactly 1 (could use for single master write hg))
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -i 10 -t hg -w 1:1 -c 1:1
+
+# check proxysql hostgroup status (check number of hosts live in hostgroup 11; warning if less than 2, critical if less than 1)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -i 11 -t hg -w 2: -c 1:
+
+# check proxysql mysql_users persistence (check than disk.mysql_users, main.mysql_users, and main.runtime_mysql_users all have the same hash (table name passed in -n var))
+# mysql users has a bunch of special rules because main.runtime_mysql_users isn't represented quite the same way as the other tables
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t pers -n mysql_users
+
+# check proxysql mysql_users persistence (check than disk.mysql_users, main.mysql_users, and main.runtime_mysql_users all have the same hash, excluding the comment column)
+#  (-m can take a comma separated list of columns - if provided they are the list of columns to include in the hash, or if the name is prefixed with '#' the column is excluded)
+#  it's not particularly sensible to include both included columns and excluded columns, but you can do that. Just keep in mind that if there are any included columns, 
+#    they will be the only ones included in the hash calculation (with any exclusions also applied)
+proxysql-nagios -H cp3-dev-5b494d9.AZ2ONEINC.IO -u proxy_admin -p 49beFnFrZzJ2j -t pers -n mysql_users -m '#comment'
+

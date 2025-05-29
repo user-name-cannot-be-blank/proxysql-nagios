@@ -1,0 +1,58 @@
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_mysql_listener_paused
+    check_command           check_proxysql_mysql_listener_paused
+    use                     production-service-template
+}
+
+# no alerts, just get pref data for logging
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_generated_error_packets
+    check_command           check_proxysql_generated_error_packets!i!i
+    use                     production-service-template
+}
+
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_uptime
+    check_command           check_proxysql_uptime!3600:!1800:
+    use                     production-service-template
+}
+
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_persisted_rules
+    check_command           check_proxysql_persisted_rules
+    use                     production-service-template
+}
+
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_persisted_mysql_users
+    check_command           check_proxysql_persisted_mysql_users
+    use                     production-service-template
+}
+
+# no alerts, just get pref data for logging
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_connection_errors
+    check_command           check_proxysql_conn_errors!i!i
+    use                     production-service-template
+}
+
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_connection_pct_used
+    check_command           check_proxysql_conn_pct_used!50!90
+    use                     production-service-template
+}
+
+# crit if less than 1 host in hg, exclude hg 1
+define service {
+    host_name               proxysql-01
+    service_description     ProxySQL_Check_hostgroup_status
+    check_command           check_proxysql_hostgroup_status!1:!1:!-g 1
+    use                     production-service-template
+}
