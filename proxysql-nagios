@@ -420,8 +420,10 @@ def phg_check(pconn, args):
 def prules_check(pconn, args):
     if args.runtime:
         srv_table = 'runtime_mysql_query_rules'
+        src_type = 'runtime'
     else:
         srv_table = 'mysql_query_rules'
+        src_type = 'main'
     pcursor = pconn.cursor()
     pcursor.execute('SELECT * ' \
                     'FROM main.%s r ' \
@@ -439,7 +441,7 @@ def prules_check(pconn, args):
 
     if hashlib.md5(str(routput_values).encode('utf-8')).hexdigest() == hashlib.md5(str(doutput_values).encode('utf-8')).hexdigest():
         ex = nagstatus.OK
-        msg = 'Runtime and on-disk rules match'
+        msg = f"Rules {src_type} and on-disk tables match"
         matched = 1
     else:
         if args.bounds.happy:
@@ -447,10 +449,10 @@ def prules_check(pconn, args):
         else:
             ex = nagstatus.CRITICAL
       
-        msg = 'Runtime and on-disk rules DO NOT match'
+        msg = f"Rules {src_type} and on-disk tables DO NOT match"
 
 
-    msg = f"{ex.name} - {msg} | 'RulesStatus'={matched};1:1;1:1"
+    msg = f"{ex.name} - {msg} | 'QueryRules_{src_type}'={matched};1:1;1:1"
 
     print(msg)
     sys.exit(ex)
